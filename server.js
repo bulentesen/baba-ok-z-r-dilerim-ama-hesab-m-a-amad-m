@@ -4,48 +4,49 @@ const { Server } = require("socket.io");
 const mongoose = require("mongoose");
 
 const app = express();
-app.set("trust proxy", 1); // Render/proxy arkasında IP için
+app.set("trust proxy", 1);
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || "";
-const ADMIN_SECRET = process.env.ADMIN_SECRET || ""; // istersen boş bırak
+const ACCESS_KEY = process.env.ACCESS_KEY || ""; // Siteye giriş anahtarı
+const OWNER_KEY  = process.env.OWNER_KEY  || ""; // Room create/delete anahtarı
 
-// -------------------- Moderation Helpers --------------------
+// -------------------- Helpers --------------------
+function safeStr(s, max = 64) { return (s || "").toString().slice(0, max); }
+
 function normalizeTR(input = "") {
   let s = String(input).toLowerCase();
   s = s
-    .replaceAll("ç", "c").replaceAll("ğ", "g").replaceAll("ı", "i")
-    .replaceAll("ö", "o").replaceAll("ş", "s").replaceAll("ü", "u");
+    .replaceAll("ç","c").replaceAll("ğ","g").replaceAll("ı","i")
+    .replaceAll("ö","o").replaceAll("ş","s").replaceAll("ü","u");
   s = s.replace(/[^a-z0-9]+/g, " ").trim();
-  s = s.replace(/([a-z])\1{2,}/g, "$1$1"); // uzatmaları azalt
+  s = s.replace(/([a-z])\1{2,}/g, "$1$1");
   return s;
 }
-function squish(input = "") {
-  return normalizeTR(input).replace(/\s+/g, "");
+function squish(input = "") { return normalizeTR(input).replace(/\s+/g, ""); }
+
+function getClientIp(socket) {
+  const xff = socket.handshake.headers["x-forwarded-for"];
+  if (xff) return String(xff).split(",")[0].trim();
+  return socket.handshake.address;
 }
 
-// İstersen bu listeleri kendin genişlet (kısa tuttum; ağır küfürleri burada yazmana gerek yok)
-const PROFANITY_HINTS = [
-  "salak", "aptal", "geri zekali", "mal", "danglak", "serefsiz", "haysiyetsiz"
-];
+// Basit rate limit
+const lastMsgAt = new Map();
+function canSend(socketId) {
+  const now = Date.now();
+  const prev = lastMsgAt.get(socketId) || 0;
+  if (now - prev < 700) return false;
+  lastMsgAt.set(socketId, now);
+  return true;
+}
 
-const HARASSMENT_HINTS = [
-  "oldur", "gebert", "intihar et", "seni bulucam", "adres ver", "tehdit"
-];
-
-// Nefret söylemini “genel” yakalamak için: hedef + hakaret kalıbı gibi çalışır.
-// (Spesifik grup isimleri vermiyorum; bu yaklaşım her grubu eşit korur.)
-const HATE_PATTERNS = [
-  /\b(hepsi|tum)\s+\w+\s+(pis|igrenc|asagilik)\b/i,
-  /\b(\w+)\s+(yok\s+olmali|olmesin|defolsun)\b/i
-];
-
-// Illegal sale: uyuşturucu + satış niyeti birlikteyse
-const DRUG_HINTS = ["uyusturucu", "esrar", "kenevir", "kokain", "eroin", "mdma", "bonzai", "met", "meth"];
-const SALE_HINTS = ["satis", "satilik", "fiyat", "teslimat", "kargo", "elden", "dm", "telegram", "whatsapp"];
+// Moderation: illegal sale -> hard ban
+const DRUG_HINTS = ["uyusturucu","esrar","kenevir","kokain","eroin","mdma","bonzai","met","meth"];
+const SALE_HINTS = ["satis","satilik","fiyat","teslimat","kargo","elden","dm","telegram","whatsapp"];
 
 function shouldBlockIllegalSale(text) {
   const n = normalizeTR(text);
@@ -57,31 +58,28 @@ function shouldBlockIllegalSale(text) {
   return false;
 }
 
-function shouldBlockProfanityOrHarassment(text) {
+// “BM/Avrupa uyumlu” genel taciz/nefret/küfür engeli (hedef ülke/millet bazlı ayrım yok)
+const PROFANITY_HINTS = ["salak","aptal","geri zekali","mal","serefsiz","haysiyetsiz"];
+const HARASSMENT_HINTS = ["oldur","gebert","intihar et","seni bulucam","adres ver","tehdit"];
+const HATE_PATTERNS = [
+  /\b(hepsi|tum)\s+\w+\s+(pis|igrenc|asagilik)\b/i,
+  /\b(\w+)\s+(yok\s+olmali|olmesin|defolsun)\b/i
+];
+
+function shouldBlockAbuse(text) {
   const n = normalizeTR(text);
   const q = squish(text);
-
   const prof = PROFANITY_HINTS.some(w => n.includes(w) || q.includes(squish(w)));
-  const har = HARASSMENT_HINTS.some(w => n.includes(w) || q.includes(squish(w)));
+  const har  = HARASSMENT_HINTS.some(w => n.includes(w) || q.includes(squish(w)));
   const hate = HATE_PATTERNS.some(r => r.test(n));
-
   return { prof, har, hate, block: (prof || har || hate) };
 }
 
-function getClientIp(socket) {
-  const xff = socket.handshake.headers["x-forwarded-for"];
-  if (xff) return String(xff).split(",")[0].trim();
-  return socket.handshake.address;
-}
-
-// Basit spam limiti
-const lastMsgAt = new Map(); // socket.id -> ts
-function canSend(socketId) {
-  const now = Date.now();
-  const prev = lastMsgAt.get(socketId) || 0;
-  if (now - prev < 700) return false; // 0.7sn
-  lastMsgAt.set(socketId, now);
-  return true;
+function rndToken(len=40){
+  const chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let t="";
+  for(let i=0;i<len;i++) t+=chars[Math.floor(Math.random()*chars.length)];
+  return t;
 }
 
 // -------------------- DB Models --------------------
@@ -91,7 +89,7 @@ const messageSchema = new mongoose.Schema({
   name: String,
   text: String,
   ts: { type: Number, index: true }
-}, { versionKey: false });
+},{versionKey:false});
 const Message = mongoose.model("Message", messageSchema);
 
 const roomSchema = new mongoose.Schema({
@@ -99,7 +97,7 @@ const roomSchema = new mongoose.Schema({
   inviteToken: String,
   ownerUserId: String,
   createdAt: { type: Date, default: Date.now }
-}, { versionKey: false });
+},{versionKey:false});
 const Room = mongoose.model("Room", roomSchema);
 
 const presenceSchema = new mongoose.Schema({
@@ -108,7 +106,7 @@ const presenceSchema = new mongoose.Schema({
   name: String,
   isOnline: Boolean,
   lastSeen: Number
-}, { versionKey: false });
+},{versionKey:false});
 presenceSchema.index({ room: 1, userId: 1 }, { unique: true });
 const Presence = mongoose.model("Presence", presenceSchema);
 
@@ -118,37 +116,119 @@ const userBanSchema = new mongoose.Schema({
   reason: String,
   until: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }
-}, { versionKey: false });
+},{versionKey:false});
 const UserBan = mongoose.model("UserBan", userBanSchema);
 
 const ipBanSchema = new mongoose.Schema({
   ip: { type: String, unique: true, index: true },
   reason: String,
-  until: { type: Number, default: 0 }, // 0 = kalıcı
+  until: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }
-}, { versionKey: false });
+},{versionKey:false});
 const IPBan = mongoose.model("IPBan", ipBanSchema);
-
-const reportSchema = new mongoose.Schema({
-  room: String,
-  reporterUserId: String,
-  targetUserId: String,
-  text: String,
-  ts: { type: Number, default: () => Date.now() }
-}, { versionKey: false });
-const Report = mongoose.model("Report", reportSchema);
 
 const strikeSchema = new mongoose.Schema({
   room: String,
   userId: { type: String, index: true },
   strikes: { type: Number, default: 0 },
   updatedAt: { type: Number, default: () => Date.now() }
-}, { versionKey: false });
+},{versionKey:false});
 strikeSchema.index({ room: 1, userId: 1 }, { unique: true });
 const Strike = mongoose.model("Strike", strikeSchema);
 
-// -------------------- HTML (single page) --------------------
-const html = `<!doctype html>
+// -------------------- Pages --------------------
+function mustHaveAccessKey(req, res) {
+  if (!ACCESS_KEY) return true; // dev ortamı
+  if (req.query.k !== ACCESS_KEY) {
+    res.status(403).send("Forbidden. Go to /login");
+    return false;
+  }
+  return true;
+}
+
+const loginHtml = `<!doctype html><html lang="tr">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Giriş</title>
+<style>
+body{font-family:system-ui;margin:0;background:#111;color:#eee}
+.wrap{max-width:520px;margin:70px auto;padding:18px}
+.card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:14px;padding:16px}
+input,button{padding:10px 12px;border-radius:10px;border:1px solid #333;background:#101010;color:#eee;width:100%}
+button{cursor:pointer;margin-top:10px}
+.small{font-size:12px;color:#bbb;margin-top:10px;line-height:1.4}
+a{color:#9be7ff}
+</style></head>
+<body><div class="wrap"><div class="card">
+<h2>Safe Chat - Giriş</h2>
+<p class="small">Bu uygulama yalnızca gizli erişim anahtarı ile açılır.</p>
+<input id="k" placeholder="Erişim Anahtarı (ACCESS KEY)"/>
+<button id="go">Giriş</button>
+<div class="small">
+<a href="/privacy" target="_blank">Gizlilik Politikası</a> ·
+<a href="/terms" target="_blank">Kullanım Şartları</a>
+</div>
+<div class="small" id="err"></div>
+</div></div>
+<script>
+document.getElementById("go").onclick=()=>{
+  const k=document.getElementById("k").value.trim();
+  if(!k){document.getElementById("err").textContent="Anahtar gerekli.";return;}
+  // Anahtarı tarayıcıda sakla (telefon no yok)
+  localStorage.setItem("access_key", k);
+  location.href="/chat?k="+encodeURIComponent(k)+location.hash;
+};
+</script>
+</body></html>`;
+
+const privacyHtml = `<!doctype html><html lang="tr"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Gizlilik Politikası</title>
+<style>body{font-family:system-ui;max-width:900px;margin:40px auto;line-height:1.6;padding:0 14px}</style>
+</head><body>
+<h1>Gizlilik Politikası</h1>
+<p><b>Yürürlük Tarihi:</b> 14 Şubat 2026</p>
+<p>Bu uygulama yalnızca davet bağlantısı ve erişim anahtarı ile kullanılabilen özel bir sohbet servisidir.</p>
+<h2>Toplanan Veriler</h2>
+<ul>
+<li>Kullanıcı adı (nickname)</li>
+<li>Tarayıcıda üretilen userId (telefon numarası yok)</li>
+<li>Mesaj içerikleri (opsiyonel olarak kalıcı saklama)</li>
+<li>Oda/Grup bilgisi, bağlantı zamanları, last seen</li>
+<li>Güvenlik amaçlı IP adresi (kötüye kullanım ve ban için)</li>
+</ul>
+<h2>İşleme Amaçları</h2>
+<ul>
+<li>Mesajlaşma hizmetini sağlamak</li>
+<li>Küfür/taciz/nefret/illegal satış gibi içerikleri engellemek ve ban uygulamak</li>
+<li>Online/offline durumu göstermek</li>
+</ul>
+<h2>Paylaşım</h2>
+<p>Veriler reklam/pazarlama amacıyla satılmaz. Altyapı sağlayıcıları (barındırma/veritabanı) üzerinde saklanabilir.</p>
+<h2>Saklama</h2>
+<p>Oda sahibi/uygulama sahibi odaları ve mesajları silebilir (purge). Ban kayıtları güvenlik için kalıcı veya süreli tutulabilir.</p>
+</body></html>`;
+
+const termsHtml = `<!doctype html><html lang="tr"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Kullanım Şartları</title>
+<style>body{font-family:system-ui;max-width:900px;margin:40px auto;line-height:1.6;padding:0 14px}</style>
+</head><body>
+<h1>Kullanım Şartları</h1>
+<p><b>Yürürlük Tarihi:</b> 14 Şubat 2026</p>
+<p>Bu uygulama özel davet ile kullanılan bir sohbet servisidir.</p>
+<h2>Yasak İçerikler</h2>
+<ul>
+<li>Yasal olmayan ürün/hizmet satışı (özellikle uyuşturucu satışı) — <b>anında ban</b></li>
+<li>Taciz, tehdit, zorbalık</li>
+<li>Nefret söylemi ve hedef gösterme</li>
+<li>Aşırı küfür/rahatsız edici içerik</li>
+</ul>
+<h2>Yaptırımlar</h2>
+<p>Kurallar ihlal edilirse mesaj engellenebilir, kullanıcı atılabilir veya IP/userId bazlı ban uygulanabilir.</p>
+</body></html>`;
+
+// Chat UI (tek sayfa)
+const chatHtml = `<!doctype html>
 <html lang="tr">
 <head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -160,7 +240,7 @@ body{font-family:system-ui,Arial;margin:0;background:#111;color:#eee}
 .row{display:flex;gap:10px;flex-wrap:wrap}
 input,button{padding:10px 12px;border-radius:10px;border:1px solid #333;background:#101010;color:#eee}
 button{cursor:pointer}
-#chat{height:55vh;overflow:auto;background:#0d0d0d;border:1px solid #2a2a2a;border-radius:14px;padding:12px}
+#chat{height:52vh;overflow:auto;background:#0d0d0d;border:1px solid #2a2a2a;border-radius:14px;padding:12px}
 .msg{margin:8px 0}
 .name{color:#9be7ff}
 .sys{color:#aaa;font-style:italic}
@@ -174,6 +254,7 @@ button{cursor:pointer}
 .badge{padding:2px 8px;border-radius:999px;border:1px solid #333;background:#141414;color:#bbb;font-size:12px}
 .ok{color:#7CFC00}
 .off{color:#aaa}
+a{color:#9be7ff}
 </style>
 </head>
 <body>
@@ -187,6 +268,12 @@ button{cursor:pointer}
     <div class="pill" id="members">online: -</div>
   </div>
 
+  <div class="row" style="margin-top:8px">
+    <a class="small" href="/privacy" target="_blank">Gizlilik</a>
+    <a class="small" href="/terms" target="_blank">Şartlar</a>
+    <a class="small" href="/login">Çıkış / Giriş</a>
+  </div>
+
   <div class="row" style="margin-top:10px">
     <input id="name" placeholder="Adın"/>
     <input id="room" placeholder="Oda (ör: kuzen)"/>
@@ -196,7 +283,7 @@ button{cursor:pointer}
 
   <div class="row" style="margin-top:6px">
     <label class="small"><input type="checkbox" id="ageOk"/> 13+ olduğumu onaylıyorum</label>
-    <span class="small">• Küfür / taciz / nefret / illegal satış otomatik engellenir.</span>
+    <label class="small"><input type="checkbox" id="showHistory"/> Geçmişi göster (varsayılan kapalı)</label>
   </div>
 
   <div style="margin-top:12px" id="chat"></div>
@@ -205,7 +292,6 @@ button{cursor:pointer}
   <div class="row" style="margin-top:10px">
     <input id="text" placeholder="Mesaj yaz..." style="flex:1;min-width:240px" disabled/>
     <button id="sendBtn" disabled>Gönder</button>
-    <button id="reportBtn" disabled>Son mesajı şikayet et</button>
   </div>
 
   <div class="list">
@@ -216,24 +302,13 @@ button{cursor:pointer}
 
 <script src="/socket.io/socket.io.js"></script>
 <script>
-const socket = io();
-const elChat = document.getElementById("chat");
-const elName = document.getElementById("name");
-const elRoom = document.getElementById("room");
-const elToken = document.getElementById("token");
-const elJoin = document.getElementById("joinBtn");
-const elText = document.getElementById("text");
-const elSend = document.getElementById("sendBtn");
-const elReport = document.getElementById("reportBtn");
-const elTyping = document.getElementById("typing");
-const elMembers = document.getElementById("members");
-const elRoomPill = document.getElementById("roomPill");
-const elPresence = document.getElementById("presenceList");
-const elAgeOk = document.getElementById("ageOk");
-const elDbPill = document.getElementById("dbPill");
-
-let joined=false, currentRoom="", lastReceived=null;
-
+function getAccessKey(){
+  // URL'de yoksa localStorage'dan al
+  const url = new URL(location.href);
+  let k = url.searchParams.get("k");
+  if(!k) k = localStorage.getItem("access_key") || "";
+  return k;
+}
 function uid(){
   let id = localStorage.getItem("uid");
   if(!id){
@@ -242,6 +317,34 @@ function uid(){
   }
   return id;
 }
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
+  }[c]));
+}
+
+const accessKey = getAccessKey();
+if(!accessKey){ location.href="/login"; }
+
+const socket = io({ query: { k: accessKey } });
+
+const elChat = document.getElementById("chat");
+const elName = document.getElementById("name");
+const elRoom = document.getElementById("room");
+const elToken = document.getElementById("token");
+const elJoin = document.getElementById("joinBtn");
+const elText = document.getElementById("text");
+const elSend = document.getElementById("sendBtn");
+const elTyping = document.getElementById("typing");
+const elMembers = document.getElementById("members");
+const elRoomPill = document.getElementById("roomPill");
+const elPresence = document.getElementById("presenceList");
+const elAgeOk = document.getElementById("ageOk");
+const elShowHistory = document.getElementById("showHistory");
+const elDbPill = document.getElementById("dbPill");
+
+let joined=false, currentRoom="";
+
 function addLine(html){
   const div=document.createElement("div");
   div.className="msg";
@@ -249,24 +352,21 @@ function addLine(html){
   elChat.appendChild(div);
   elChat.scrollTop=elChat.scrollHeight;
 }
-function esc(s){
-  return String(s).replace(/[&<>"']/g, c => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
-  }[c]));
-}
 
 elJoin.onclick=()=>{
   const name=(elName.value.trim()||"Anon").slice(0,24);
   const room=(elRoom.value.trim()||"lobby").slice(0,24);
   const inviteToken=(elToken.value.trim()||"").slice(0,64);
   const ageOk = !!elAgeOk.checked;
+  const showHistory = !!elShowHistory.checked;
 
   currentRoom=room;
   elRoomPill.textContent="room: "+room;
-  socket.emit("join",{ userId: uid(), name, room, inviteToken, ageOk });
+
+  socket.emit("join",{ userId: uid(), name, room, inviteToken, ageOk, showHistory });
 
   joined=true;
-  elText.disabled=false; elSend.disabled=false; elReport.disabled=false;
+  elText.disabled=false; elSend.disabled=false;
   addLine('<span class="sys">Bağlandın: <b>'+esc(name)+'</b> (room: <b>'+esc(room)+'</b>)</span>');
 };
 
@@ -291,40 +391,26 @@ elText.addEventListener("input",()=>{
   typingTimer=setTimeout(()=>socket.emit("typing",{ room: currentRoom, name, isTyping:false }),700);
 });
 
-elReport.onclick=()=>{
-  if(!lastReceived) return;
-  socket.emit("report", {
-    room: currentRoom,
-    reporterUserId: uid(),
-    targetUserId: lastReceived.userId || "",
-    text: lastReceived.text || ""
-  });
-  addLine('<span class="sys">Şikayet gönderildi.</span>');
-};
-
-socket.on("db_status",(x)=>{ elDbPill.textContent = "db: " + (x?.ok ? "ok" : "off"); });
+socket.on("db_status",(x)=>{ elDbPill.textContent="db: "+(x?.ok?"ok":"off"); });
 
 socket.on("history",(items)=>{
   for(const m of items){
-    lastReceived = m;
     addLine('<span class="name"><b>'+esc(m.name)+':</b></span> '+esc(m.text));
   }
 });
 
 socket.on("chat",(m)=>{
-  lastReceived = m;
   addLine('<span class="name"><b>'+esc(m.name)+':</b></span> '+esc(m.text));
 });
 
 socket.on("system",(m)=> addLine('<span class="sys">'+esc(m.text)+'</span>'));
 
 socket.on("presence_full",({list})=>{
-  // list: [{name,isOnline,lastSeen,userId}]
-  elMembers.textContent = "online: " + list.filter(x=>x.isOnline).length + " / " + list.length;
-  elPresence.innerHTML = list.map(u=>{
+  elMembers.textContent="online: "+list.filter(x=>x.isOnline).length+" / "+list.length;
+  elPresence.innerHTML=list.map(u=>{
     const st = u.isOnline ? '<span class="badge ok">online</span>' : '<span class="badge off">offline</span>';
     const ls = u.lastSeen ? new Date(u.lastSeen).toLocaleString() : "-";
-    return '<div class="user"><div><b>'+esc(u.name||"Anon")+'</b> <span class="small">('+esc(u.userId||"")+')</span></div><div>'+st+' <span class="small">'+esc(ls)+'</span></div></div>';
+    return '<div class="user"><div><b>'+esc(u.name||"Anon")+'</b></div><div>'+st+' <span class="small">'+esc(ls)+'</span></div></div>';
   }).join("");
 });
 
@@ -334,24 +420,73 @@ socket.on("blocked",(x)=> addLine('<span class="sys">Engellendi: '+esc(x?.reason
 
 socket.on("connect_error",(err)=>{
   addLine('<span class="sys">Bağlantı hatası: '+esc(err?.message||"")+'</span>');
+  if((err?.message||"").includes("FORBIDDEN")) location.href="/login";
 });
 </script>
 </body></html>`;
 
-app.get("/", (req, res) => {
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(html);
+// -------------------- Routes --------------------
+app.get("/login", (req,res)=> {
+  res.setHeader("Content-Type","text/html; charset=utf-8");
+  res.send(loginHtml);
 });
 
-// -------------------- DB Connect --------------------
+app.get("/privacy", (req,res)=> {
+  res.setHeader("Content-Type","text/html; charset=utf-8");
+  res.send(privacyHtml);
+});
+
+app.get("/terms", (req,res)=> {
+  res.setHeader("Content-Type","text/html; charset=utf-8");
+  res.send(termsHtml);
+});
+
+app.get("/chat", (req,res)=> {
+  if (!mustHaveAccessKey(req, res)) return;
+  res.setHeader("Content-Type","text/html; charset=utf-8");
+  res.send(chatHtml);
+});
+
+// Owner endpoints (mesaj görmeden oda yönetimi)
+app.get("/owner/create-room", async (req,res)=>{
+  if (!OWNER_KEY || req.query.ok !== OWNER_KEY) return res.status(403).send("Forbidden");
+  if (!ACCESS_KEY) return res.status(400).send("ACCESS_KEY required");
+  const room = safeStr(req.query.room, 24);
+  if(!room) return res.status(400).send("room required");
+
+  const token = rndToken(40);
+  await Room.updateOne(
+    { room },
+    { $set: { room, inviteToken: token, createdAt: new Date() } },
+    { upsert: true }
+  );
+
+  const base = `${req.protocol}://${req.get("host")}`;
+  const invite = `${base}/chat?k=${encodeURIComponent(ACCESS_KEY)}#room=${encodeURIComponent(room)}&token=${encodeURIComponent(token)}`;
+  res.json({ room, token, invite });
+});
+
+app.get("/owner/delete-room", async (req,res)=>{
+  if (!OWNER_KEY || req.query.ok !== OWNER_KEY) return res.status(403).send("Forbidden");
+  const room = safeStr(req.query.room, 24);
+  if(!room) return res.status(400).send("room required");
+
+  await Promise.all([
+    Room.deleteOne({ room }),
+    Message.deleteMany({ room }),
+    Presence.deleteMany({ room }),
+    Strike.deleteMany({ room }),
+    UserBan.deleteMany({ room })
+  ]);
+
+  res.json({ ok:true, deletedRoom: room });
+});
+
+// -------------------- DB connect --------------------
 let DB_OK = false;
 
 async function connectDb() {
-  if (!MONGODB_URI) {
-    console.warn("MONGODB_URI yok -> DB OFF");
-    DB_OK = false;
-    return;
-  }
+  if (!MONGODB_URI) { DB_OK = false; return; }
   await mongoose.connect(MONGODB_URI, {
     serverSelectionTimeoutMS: 5000,
     connectTimeoutMS: 5000,
@@ -361,82 +496,65 @@ async function connectDb() {
   console.log("MongoDB connected");
 }
 
-// -------------------- Security Gate: IP ban before connect --------------------
+// -------------------- Socket auth gate --------------------
 io.use(async (socket, next) => {
-  if (!DB_OK) return next(); // DB yoksa ban kontrol yok
-  try {
-    const ip = getClientIp(socket);
-    const ban = await IPBan.findOne({ ip }).lean();
-    if (ban && (ban.until === 0 || ban.until > Date.now())) return next(new Error("IP_BANNED"));
-  } catch {}
+  // ACCESS KEY kontrolü
+  if (ACCESS_KEY) {
+    const k = socket.handshake.query?.k;
+    if (k !== ACCESS_KEY) return next(new Error("FORBIDDEN"));
+  }
+
+  // IP ban kontrolü
+  if (DB_OK) {
+    try {
+      const ip = getClientIp(socket);
+      const ban = await IPBan.findOne({ ip }).lean();
+      if (ban && (ban.until === 0 || ban.until > Date.now())) return next(new Error("IP_BANNED"));
+    } catch {}
+  }
   next();
 });
 
-// -------------------- Realtime State --------------------
-const onlineSockets = new Map(); // socket.id -> { room, userId, name }
-
-// presence publish helper
+// -------------------- Presence publish --------------------
 async function publishPresence(room) {
   if (!DB_OK) return;
   const list = await Presence.find({ room })
     .sort({ isOnline: -1, lastSeen: -1 })
-    .limit(100)
+    .limit(200)
     .lean();
   io.to(room).emit("presence_full", { list });
 }
 
-function safeStr(s, max = 24) {
-  return (s || "").toString().slice(0, max);
-}
+// -------------------- Realtime --------------------
+const onlineSockets = new Map(); // socket.id -> { room, userId, name }
 
 io.on("connection", (socket) => {
   socket.emit("db_status", { ok: DB_OK });
 
-  socket.on("join", async ({ userId, name, room, inviteToken, ageOk }) => {
+  socket.on("join", async ({ userId, name, room, inviteToken, ageOk, showHistory }) => {
     const safeRoom = safeStr(room, 24) || "lobby";
     const safeName = safeStr(name, 24) || "Anon";
     const safeUserId = safeStr(userId, 80);
+    const token = safeStr(inviteToken, 64);
 
-    if (!ageOk) {
-      socket.emit("blocked", { reason: "Age gate failed" });
-      socket.disconnect(true);
-      return;
-    }
+    if (!ageOk) { socket.emit("blocked",{reason:"Age gate failed"}); socket.disconnect(true); return; }
 
-    const ip = getClientIp(socket);
-
-    // DB varsa: invite-only + bans
     if (DB_OK) {
-      // IP ban kontrol (ek güvenlik)
-      const ipBan = await IPBan.findOne({ ip }).lean();
-      if (ipBan && (ipBan.until === 0 || ipBan.until > Date.now())) {
-        socket.emit("blocked", { reason: "IP banned" });
-        socket.disconnect(true);
-        return;
-      }
-
+      // user ban
       const ub = await UserBan.findOne({ room: safeRoom, userId: safeUserId }).lean();
       if (ub && (ub.until === 0 || ub.until > Date.now())) {
-        socket.emit("blocked", { reason: "User banned" });
-        socket.disconnect(true);
-        return;
+        socket.emit("blocked",{reason:"User banned"}); socket.disconnect(true); return;
       }
 
-      // Room invite kontrol
+      // invite-only room kontrol
       const r = await Room.findOne({ room: safeRoom }).lean();
       if (r) {
-        if (r.inviteToken && inviteToken !== r.inviteToken) {
-          socket.emit("blocked", { reason: "Invite required / token invalid" });
-          socket.disconnect(true);
-          return;
+        if (r.inviteToken && token !== r.inviteToken) {
+          socket.emit("blocked",{reason:"Invite required / token invalid"}); socket.disconnect(true); return;
         }
       } else {
-        // oda ilk kez oluşuyorsa: owner yap, token boşsa invite-only yapma
-        await Room.create({
-          room: safeRoom,
-          inviteToken: safeStr(inviteToken, 64) || "",
-          ownerUserId: safeUserId
-        });
+        // oda yoksa: token verilirse invite-only olarak aç
+        await Room.create({ room: safeRoom, inviteToken: token || "", ownerUserId: safeUserId });
       }
 
       // Presence online
@@ -450,8 +568,8 @@ io.on("connection", (socket) => {
     onlineSockets.set(socket.id, { room: safeRoom, userId: safeUserId, name: safeName });
     socket.join(safeRoom);
 
-    // history
-    if (DB_OK) {
+    // history (default OFF)
+    if (DB_OK && showHistory) {
       try {
         const items = await Message.find({ room: safeRoom }).sort({ ts: -1 }).limit(30).lean();
         socket.emit("history", items.reverse());
@@ -459,7 +577,6 @@ io.on("connection", (socket) => {
     }
 
     io.to(safeRoom).emit("system", { text: `${safeName} katıldı.` });
-
     if (DB_OK) await publishPresence(safeRoom);
   });
 
@@ -467,18 +584,6 @@ io.on("connection", (socket) => {
     const safeRoom = safeStr(room, 24) || "lobby";
     const safeName = safeStr(name, 24) || "Anon";
     socket.to(safeRoom).emit("typing", { name: safeName, isTyping: !!isTyping });
-  });
-
-  socket.on("report", async ({ room, reporterUserId, targetUserId, text }) => {
-    if (!DB_OK) return;
-    const safeRoom = safeStr(room, 24) || "lobby";
-    await Report.create({
-      room: safeRoom,
-      reporterUserId: safeStr(reporterUserId, 80),
-      targetUserId: safeStr(targetUserId, 80),
-      text: safeStr(text, 500),
-      ts: Date.now()
-    });
   });
 
   socket.on("chat", async ({ room, userId, name, text }) => {
@@ -491,8 +596,8 @@ io.on("connection", (socket) => {
 
     const ip = getClientIp(socket);
 
-    // 1) Illegal sale => anında IP + user ban + disconnect
-    if (shouldBlockIllegalSale(msg) && DB_OK) {
+    // 1) Illegal sale => anında IP+User ban + disconnect
+    if (DB_OK && shouldBlockIllegalSale(msg)) {
       await IPBan.updateOne(
         { ip },
         { $set: { reason: "Illegal sale content (auto-ban)", until: 0 } },
@@ -508,8 +613,8 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // 2) Profanity/Harassment/Hate => strike sistemi
-    const chk = shouldBlockProfanityOrHarassment(msg);
+    // 2) Abuse => strike; 3. ihlalde ban (IP+userId)
+    const chk = shouldBlockAbuse(msg);
     if (chk.block) {
       if (DB_OK) {
         const up = await Strike.findOneAndUpdate(
@@ -517,11 +622,8 @@ io.on("connection", (socket) => {
           { $inc: { strikes: 1 }, $set: { updatedAt: Date.now() } },
           { upsert: true, new: true }
         );
-
         const strikes = up?.strikes || 1;
 
-        // Politikayı sert tuttum:
-        // 1 = blok + uyarı, 2 = kick, 3 = ban (user+ip)
         if (strikes >= 3) {
           await UserBan.updateOne(
             { room: safeRoom, userId: safeUserId },
@@ -546,19 +648,15 @@ io.on("connection", (socket) => {
 
         socket.emit("blocked", { reason: "Message blocked (1/3)" });
         return;
-      } else {
-        socket.emit("blocked", { reason: "Message blocked" });
-        return;
       }
+
+      socket.emit("blocked", { reason: "Message blocked" });
+      return;
     }
 
     const ts = Date.now();
-
-    // Save + broadcast
     if (DB_OK) {
-      try {
-        await Message.create({ room: safeRoom, userId: safeUserId, name: safeName, text: msg, ts });
-      } catch {}
+      try { await Message.create({ room: safeRoom, userId: safeUserId, name: safeName, text: msg, ts }); } catch {}
     }
     io.to(safeRoom).emit("chat", { userId: safeUserId, name: safeName, text: msg, ts });
   });
@@ -584,10 +682,7 @@ io.on("connection", (socket) => {
 
 // -------------------- Start --------------------
 connectDb()
-  .catch(e => {
-    console.error("Mongo connect failed:", e.message);
-    DB_OK = false; // DB olmadan da çalışsın
-  })
+  .catch(e => { console.error("Mongo connect failed:", e.message); DB_OK = false; })
   .finally(() => {
     server.listen(PORT, () => console.log(`Running on :${PORT}`));
   });
