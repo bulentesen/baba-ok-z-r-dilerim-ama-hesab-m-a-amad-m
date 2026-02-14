@@ -1,14 +1,12 @@
 {
-  "name": "mini-chat-nopublic",
+  "name": "mini-chat-mongo",
   "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "express": "^4.19.2",
-    "socket.io": "^4.7.5"
+    "socket.io": "^4.7.5",
+    "mongoose": "^8.10.0"
   }
 }
-
