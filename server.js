@@ -3,18 +3,20 @@ const http = require("http");
 const { Server } = require("socket.io");
 const mongoose = require("mongoose");
 
+// ====================== CONFIG ======================
+const PORT = process.env.PORT || 3000;
+const MONGODB_URI = process.env.MONGODB_URI || "";
+const ACCESS_KEY = process.env.ACCESS_KEY || ""; // sadece senin bildiğin anahtar
+const OWNER_KEY  = process.env.OWNER_KEY  || ""; // room create/delete için ayrı anahtar
+
+// ====================== APP/SERVER ======================
 const app = express();
-app.set("trust proxy", 1);
+app.set("trust proxy", 1); // Render/proxy arkasında gerçek IP için
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-const PORT = process.env.PORT || 3000;
-const MONGODB_URI = process.env.MONGODB_URI || "";
-const ACCESS_KEY = process.env.ACCESS_KEY || ""; // Siteye giriş anahtarı
-const OWNER_KEY  = process.env.OWNER_KEY  || ""; // Room create/delete anahtarı
-
-// -------------------- Helpers --------------------
+// ====================== HELPERS ======================
 function safeStr(s, max = 64) { return (s || "").toString().slice(0, max); }
 
 function normalizeTR(input = "") {
@@ -34,7 +36,14 @@ function getClientIp(socket) {
   return socket.handshake.address;
 }
 
-// Basit rate limit
+function rndToken(len=40){
+  const chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let t="";
+  for(let i=0;i<len;i++) t+=chars[Math.floor(Math.random()*chars.length)];
+  return t;
+}
+
+// Rate limit
 const lastMsgAt = new Map();
 function canSend(socketId) {
   const now = Date.now();
@@ -44,7 +53,8 @@ function canSend(socketId) {
   return true;
 }
 
-// Moderation: illegal sale -> hard ban
+// ====================== MODERATION ======================
+// Illegal sale -> hard ban
 const DRUG_HINTS = ["uyusturucu","esrar","kenevir","kokain","eroin","mdma","bonzai","met","meth"];
 const SALE_HINTS = ["satis","satilik","fiyat","teslimat","kargo","elden","dm","telegram","whatsapp"];
 
@@ -58,7 +68,7 @@ function shouldBlockIllegalSale(text) {
   return false;
 }
 
-// “BM/Avrupa uyumlu” genel taciz/nefret/küfür engeli (hedef ülke/millet bazlı ayrım yok)
+// General anti-abuse (BM/Avrupa uyumlu: grup hedeflemeyen, genel yaklaşım)
 const PROFANITY_HINTS = ["salak","aptal","geri zekali","mal","serefsiz","haysiyetsiz"];
 const HARASSMENT_HINTS = ["oldur","gebert","intihar et","seni bulucam","adres ver","tehdit"];
 const HATE_PATTERNS = [
@@ -75,14 +85,7 @@ function shouldBlockAbuse(text) {
   return { prof, har, hate, block: (prof || har || hate) };
 }
 
-function rndToken(len=40){
-  const chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  let t="";
-  for(let i=0;i<len;i++) t+=chars[Math.floor(Math.random()*chars.length)];
-  return t;
-}
-
-// -------------------- DB Models --------------------
+// ====================== DB MODELS ======================
 const messageSchema = new mongoose.Schema({
   room: { type: String, index: true },
   userId: { type: String, index: true },
@@ -136,7 +139,20 @@ const strikeSchema = new mongoose.Schema({
 strikeSchema.index({ room: 1, userId: 1 }, { unique: true });
 const Strike = mongoose.model("Strike", strikeSchema);
 
-// -------------------- Pages --------------------
+// ====================== DB CONNECT ======================
+let DB_OK = false;
+async function connectDb() {
+  if (!MONGODB_URI) { DB_OK = false; return; }
+  await mongoose.connect(MONGODB_URI, {
+    serverSelectionTimeoutMS: 5000,
+    connectTimeoutMS: 5000,
+    socketTimeoutMS: 20000
+  });
+  DB_OK = true;
+  console.log("MongoDB connected");
+}
+
+// ====================== PAGES ======================
 function mustHaveAccessKey(req, res) {
   if (!ACCESS_KEY) return true; // dev ortamı
   if (req.query.k !== ACCESS_KEY) {
@@ -173,7 +189,6 @@ a{color:#9be7ff}
 document.getElementById("go").onclick=()=>{
   const k=document.getElementById("k").value.trim();
   if(!k){document.getElementById("err").textContent="Anahtar gerekli.";return;}
-  // Anahtarı tarayıcıda sakla (telefon no yok)
   localStorage.setItem("access_key", k);
   location.href="/chat?k="+encodeURIComponent(k)+location.hash;
 };
@@ -227,7 +242,6 @@ const termsHtml = `<!doctype html><html lang="tr"><head><meta charset="utf-8"/>
 <p>Kurallar ihlal edilirse mesaj engellenebilir, kullanıcı atılabilir veya IP/userId bazlı ban uygulanabilir.</p>
 </body></html>`;
 
-// Chat UI (tek sayfa)
 const chatHtml = `<!doctype html>
 <html lang="tr">
 <head>
@@ -303,7 +317,6 @@ a{color:#9be7ff}
 <script src="/socket.io/socket.io.js"></script>
 <script>
 function getAccessKey(){
-  // URL'de yoksa localStorage'dan al
   const url = new URL(location.href);
   let k = url.searchParams.get("k");
   if(!k) k = localStorage.getItem("access_key") || "";
@@ -398,11 +411,9 @@ socket.on("history",(items)=>{
     addLine('<span class="name"><b>'+esc(m.name)+':</b></span> '+esc(m.text));
   }
 });
-
 socket.on("chat",(m)=>{
   addLine('<span class="name"><b>'+esc(m.name)+':</b></span> '+esc(m.text));
 });
-
 socket.on("system",(m)=> addLine('<span class="sys">'+esc(m.text)+'</span>'));
 
 socket.on("presence_full",({list})=>{
@@ -425,7 +436,12 @@ socket.on("connect_error",(err)=>{
 </script>
 </body></html>`;
 
-// -------------------- Routes --------------------
+// ====================== ROUTES ======================
+// Fix: Cannot GET /
+app.get("/", (req,res) => {
+  return res.redirect("/login");
+});
+
 app.get("/login", (req,res)=> {
   res.setHeader("Content-Type","text/html; charset=utf-8");
   res.send(loginHtml);
@@ -447,7 +463,7 @@ app.get("/chat", (req,res)=> {
   res.send(chatHtml);
 });
 
-// Owner endpoints (mesaj görmeden oda yönetimi)
+// Owner endpoints: oda yönetimi (mesaj görmeden)
 app.get("/owner/create-room", async (req,res)=>{
   if (!OWNER_KEY || req.query.ok !== OWNER_KEY) return res.status(403).send("Forbidden");
   if (!ACCESS_KEY) return res.status(400).send("ACCESS_KEY required");
@@ -482,29 +498,15 @@ app.get("/owner/delete-room", async (req,res)=>{
   res.json({ ok:true, deletedRoom: room });
 });
 
-// -------------------- DB connect --------------------
-let DB_OK = false;
-
-async function connectDb() {
-  if (!MONGODB_URI) { DB_OK = false; return; }
-  await mongoose.connect(MONGODB_URI, {
-    serverSelectionTimeoutMS: 5000,
-    connectTimeoutMS: 5000,
-    socketTimeoutMS: 20000
-  });
-  DB_OK = true;
-  console.log("MongoDB connected");
-}
-
-// -------------------- Socket auth gate --------------------
+// ====================== SOCKET SECURITY GATE ======================
 io.use(async (socket, next) => {
-  // ACCESS KEY kontrolü
+  // ACCESS KEY kontrolü (socket tarafı)
   if (ACCESS_KEY) {
     const k = socket.handshake.query?.k;
     if (k !== ACCESS_KEY) return next(new Error("FORBIDDEN"));
   }
 
-  // IP ban kontrolü
+  // IP ban kontrol
   if (DB_OK) {
     try {
       const ip = getClientIp(socket);
@@ -515,7 +517,7 @@ io.use(async (socket, next) => {
   next();
 });
 
-// -------------------- Presence publish --------------------
+// ====================== PRESENCE ======================
 async function publishPresence(room) {
   if (!DB_OK) return;
   const list = await Presence.find({ room })
@@ -525,7 +527,7 @@ async function publishPresence(room) {
   io.to(room).emit("presence_full", { list });
 }
 
-// -------------------- Realtime --------------------
+// ====================== REALTIME ======================
 const onlineSockets = new Map(); // socket.id -> { room, userId, name }
 
 io.on("connection", (socket) => {
@@ -546,14 +548,14 @@ io.on("connection", (socket) => {
         socket.emit("blocked",{reason:"User banned"}); socket.disconnect(true); return;
       }
 
-      // invite-only room kontrol
+      // invite-only kontrol
       const r = await Room.findOne({ room: safeRoom }).lean();
       if (r) {
         if (r.inviteToken && token !== r.inviteToken) {
           socket.emit("blocked",{reason:"Invite required / token invalid"}); socket.disconnect(true); return;
         }
       } else {
-        // oda yoksa: token verilirse invite-only olarak aç
+        // room yoksa: token verilirse invite-only olur, token boşsa açık olur
         await Room.create({ room: safeRoom, inviteToken: token || "", ownerUserId: safeUserId });
       }
 
@@ -568,7 +570,7 @@ io.on("connection", (socket) => {
     onlineSockets.set(socket.id, { room: safeRoom, userId: safeUserId, name: safeName });
     socket.join(safeRoom);
 
-    // history (default OFF)
+    // history default OFF
     if (DB_OK && showHistory) {
       try {
         const items = await Message.find({ room: safeRoom }).sort({ ts: -1 }).limit(30).lean();
@@ -596,7 +598,7 @@ io.on("connection", (socket) => {
 
     const ip = getClientIp(socket);
 
-    // 1) Illegal sale => anında IP+User ban + disconnect
+    // Illegal sale => anında ban
     if (DB_OK && shouldBlockIllegalSale(msg)) {
       await IPBan.updateOne(
         { ip },
@@ -613,7 +615,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // 2) Abuse => strike; 3. ihlalde ban (IP+userId)
+    // Abuse => strike (3. ihlalde ban)
     const chk = shouldBlockAbuse(msg);
     if (chk.block) {
       if (DB_OK) {
@@ -680,7 +682,7 @@ io.on("connection", (socket) => {
   });
 });
 
-// -------------------- Start --------------------
+// ====================== START ======================
 connectDb()
   .catch(e => { console.error("Mongo connect failed:", e.message); DB_OK = false; })
   .finally(() => {
